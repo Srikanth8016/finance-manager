@@ -1,7 +1,7 @@
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { genAI } from "@/lib/openai";
+import { chat } from "@/lib/providers";
 import { NextRequest, NextResponse } from "next/server";
 import { startOfMonth, endOfMonth, subMonths, format } from "date-fns";
 
@@ -88,27 +88,15 @@ USER'S FINANCIAL DATA:
 ${financialContext}`;
 
   try {
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-
-    // Convert messages array to Gemini chat history format
-    const history = messages.slice(0, -1).map((m: { role: string; content: string }) => ({
-      role: m.role === "assistant" ? "model" : "user",
-      parts: [{ text: m.content }],
-    }));
-
-    const chat = model.startChat({
-      history,
-      systemInstruction: { role: "system", parts: [{ text: systemPrompt }] },
-    });
-
-    const lastMessage = messages[messages.length - 1];
-    const result = await chat.sendMessage(lastMessage.content);
-    const reply = result.response.text();
-
+    const reply = await chat(
+      messages as { role: "user" | "assistant"; content: string }[],
+      systemPrompt
+    );
     return NextResponse.json({ reply });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Gemini error";
-    console.error("Gemini error:", message);
+    const provider = process.env.AI_PROVIDER ?? "gemini";
+    const message = err instanceof Error ? err.message : "AI provider error";
+    console.error(`[${provider}] error:`, message);
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }

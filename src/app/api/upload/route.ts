@@ -1,10 +1,10 @@
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { genAI } from "@/lib/openai";
 import { NextRequest, NextResponse } from "next/server";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
-type ExtractedTx = {
+export type ExtractedTx = {
   date: string;
   description: string;
   amount: number;
@@ -12,8 +12,43 @@ type ExtractedTx = {
   category: string;
 };
 
+export type AnnotatedTx = ExtractedTx & { status: "new" | "duplicate" };
+
+// ── PDF text extraction using pdfjs-dist directly ─────────────────────────────
+// Avoids pdf-parse v2's @napi-rs/canvas native addon which can't be bundled.
+async function extractPdfText(buffer: Buffer): Promise<string> {
+  const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
+
+  // No worker thread in Node.js — run in-process
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "";
+
+  const loadingTask = pdfjsLib.getDocument({
+    data: new Uint8Array(buffer),
+    useWorkerFetch: false,
+    isEvalSupported: false,
+    useSystemFonts: true,
+  });
+
+  const pdf = await loadingTask.promise;
+  const pages: string[] = [];
+
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    const pageText = content.items
+      .map((item) => ("str" in item ? item.str : ""))
+      .join(" ");
+    pages.push(pageText);
+  }
+
+  return pages.join("\n");
+}
+
+// ── AI extraction ─────────────────────────────────────────────────────────────
 async function extractWithAI(text: string): Promise<ExtractedTx[]> {
+  const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY!);
   const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+
   const prompt = `You are a bank statement parser. Extract all transactions from the text and return a JSON object with key "transactions" containing an array.
 Each transaction must have:
 - date: ISO date string (YYYY-MM-DD)
@@ -40,6 +75,7 @@ ${text.slice(0, 8000)}`;
   return parsed.transactions || [];
 }
 
+// ── POST /api/upload — extract + annotate only, NO DB writes ──────────────────
 export async function POST(req: NextRequest) {
   const session = await getServerSession(authOptions);
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -47,7 +83,6 @@ export async function POST(req: NextRequest) {
 
   const formData = await req.formData();
   const file = formData.get("file") as File | null;
-
   if (!file) return NextResponse.json({ error: "No file uploaded" }, { status: 400 });
 
   const ext = file.name.split(".").pop()?.toLowerCase();
@@ -58,9 +93,7 @@ export async function POST(req: NextRequest) {
       text = await file.text();
     } else if (ext === "pdf") {
       const buffer = Buffer.from(await file.arrayBuffer());
-      const pdfParse = (await import("pdf-parse")).default;
-      const data = await pdfParse(buffer);
-      text = data.text;
+      text = await extractPdfText(buffer);
     } else if (ext === "xlsx" || ext === "xls") {
       const buffer = Buffer.from(await file.arrayBuffer());
       const XLSX = await import("xlsx");
@@ -68,14 +101,18 @@ export async function POST(req: NextRequest) {
       const rows: string[] = [];
       wb.SheetNames.forEach((name) => {
         const ws = wb.Sheets[name];
-        const csv = XLSX.utils.sheet_to_csv(ws);
-        rows.push(csv);
+        rows.push(XLSX.utils.sheet_to_csv(ws));
       });
       text = rows.join("\n");
     } else {
-      return NextResponse.json({ error: "Unsupported file type. Use PDF, CSV, XLS, or XLSX." }, { status: 400 });
+      return NextResponse.json(
+        { error: "Unsupported file type. Use PDF, CSV, XLS, or XLSX." },
+        { status: 400 }
+      );
     }
-  } catch {
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Unknown error";
+    console.error("[upload] file read error:", msg);
     return NextResponse.json({ error: "Failed to read file." }, { status: 500 });
   }
 
@@ -86,7 +123,9 @@ export async function POST(req: NextRequest) {
   let extracted: ExtractedTx[] = [];
   try {
     extracted = await extractWithAI(text);
-  } catch {
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Unknown error";
+    console.error("[upload] AI extraction error:", msg);
     return NextResponse.json({ error: "AI extraction failed." }, { status: 500 });
   }
 
@@ -94,22 +133,39 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "No transactions found in the file." }, { status: 400 });
   }
 
-  // Save all to DB
-  const created = await prisma.transaction.createMany({
-    data: extracted.map((t) => ({
-      userId,
-      type: t.type,
-      amount: Math.abs(t.amount),
-      description: t.description,
-      category: t.category || "Other",
-      date: new Date(t.date),
-      note: "Imported from statement",
-    })),
-    skipDuplicates: false,
+  // ── Duplicate detection (read-only) ──────────────────────────────────────────
+  const dates = extracted.map((t) => new Date(t.date).getTime()).filter((d) => !isNaN(d));
+  const minDate = new Date(Math.min(...dates));
+  const maxDate = new Date(Math.max(...dates));
+  minDate.setDate(minDate.getDate() - 1);
+  maxDate.setDate(maxDate.getDate() + 1);
+
+  const existing = await prisma.transaction.findMany({
+    where: { userId, date: { gte: minDate, lte: maxDate } },
+    select: { date: true, amount: true, description: true },
   });
 
+  const existingKeys = new Set(
+    existing.map((t) => {
+      const d = new Date(t.date).toISOString().slice(0, 10);
+      return `${d}|${t.amount}|${t.description.trim().toLowerCase()}`;
+    })
+  );
+
+  function makeKey(t: ExtractedTx): string {
+    const d = new Date(t.date).toISOString().slice(0, 10);
+    return `${d}|${Math.abs(t.amount)}|${t.description.trim().toLowerCase()}`;
+  }
+
+  const annotated: AnnotatedTx[] = extracted.map((t) => ({
+    ...t,
+    status: existingKeys.has(makeKey(t)) ? "duplicate" : "new",
+  }));
+
   return NextResponse.json({
-    imported: created.count,
-    transactions: extracted,
+    total:        annotated.length,
+    newCount:     annotated.filter((t) => t.status === "new").length,
+    duplicates:   annotated.filter((t) => t.status === "duplicate").length,
+    transactions: annotated,
   });
 }
